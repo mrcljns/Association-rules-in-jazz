@@ -1,0 +1,340 @@
+---
+title: "Association rules in jazz"
+author: "Maciej Lorens"
+date: "2023-02-04"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: false
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+Music is an art form that has been with humanity for ages. It can be said that it is constantly evolving, since there are new genres invented every now and then, but I would argue that some elements in popular music stay the same. Long ago, musicians discovered sounds that go well with each other and these sounds were combined into chords, which then formed chord progressions. When examining many popular pop songs from different times, one will find that they share exactly the same chord progressions. Since there are many different layers to the song, the casual listener may have not realized this, but in music theory terms this is quite boring. That is probably why genres like jazz exist - to push what is considered to be musically harmonious into unknown territories. In this project, I used association rules mining to discover chords that frequently appear together in compositions of a famous jazz pianist - Bill Evans. The results can be inspiring to any musician interested in broadening their songwriting repertoire.
+
+# Dataset
+
+The source of the data is <https://www.e-chords.com>, which I scraped with BeautifulSoup and Selenium and saved song names, song keys and chords separated by a semicolon into a .csv file. I presented the loaded dataset below.
+
+```{r echo=TRUE, include=FALSE}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, arules, arulesSequences, arulesViz, knitr)
+```
+
+```{r}
+billEvans <- read_csv('bill_evans_chords.csv')
+```
+
+```{r echo=FALSE}
+kable(head(billEvans))
+```
+
+The planned preprocessing of the chords requires that the third column is separated into individual rows.
+
+```{r}
+billEvans <- billEvans %>% 
+  select(name, key, chords) %>%
+  separate_rows(chords, sep=';') %>%
+  filter(grepl("^[A-Z][#b]*", chords))
+```
+
+```{r echo=FALSE}
+kable(head(billEvans))
+```
+
+# Preprocessing
+
+## Transposing all chords from the original key to the key of C major or C minor
+
+It will be much easier to understand the results of association rules mining when all songs are in the same key. For anyone not familiar with music theory, changing a key means that the song gets a higher or lower pitch than before. Its structure is not affected, because all chords are relative to a key. First, I defined the positions of each note in the chromatic scale relative to the C note.
+
+```{r}
+keys <- list("C"=1, "C#"=2, "D"=3, "Eb"=4, "E"=5, "F"=6, "F#"=7, "G"=8, "G#"=9, "A"=10, "Bb"=11, "B"=12)
+```
+
+I need to take into account that depending on the key, some chords may have two different names. The function below changes these chords into a common name to simplify the transposition.
+
+```{r}
+replaceSimilar <- function (chord){
+  if (grepl("^D#", chord)){
+    return(str_replace_all(chord, "^D#", "Eb"))
+  }
+  else if (grepl("^Db", chord)){
+    return(str_replace_all(chord, "^Db", "C#"))
+  }
+  else if (grepl("^Gb", chord)){
+    return(str_replace_all(chord, "^Gb", "F#"))
+  }
+  else if (grepl("^Ab", chord)){
+    return(str_replace_all(chord, "^Ab", "G#"))
+  }
+  else if (grepl("^A#", chord)){
+    return(str_replace_all(chord, "^A#", "Bb"))
+  }
+  else {
+    return(chord)
+  }
+}
+```
+
+Now in order to change the keys of the songs into C major or C minor, each chord in a song needs to be moved by the difference of that song key's root note to the C note. I wrote functions that achieve this result with regular expressions included in the stringr package from tidyverse. I extracted only the chord's root note (so a capital letter plus a "b" sign for a "flat" note or a "\#" for a "sharp" note), because the other characteristics of the chord (whether it is major, minor, diminished or a 7 chord etc.) will stay constant.
+
+```{r}
+transposeKey <- function (key, chord){
+  idxBase <- keys[["C"]]
+  idxKey <- keys[[str_extract(key, "^[A-Z][#b]?")]]
+  diffKey <- idxKey-idxBase
+  idxNew <- (12+keys[[str_extract(chord, "^[A-Z][#b]?")]]-diffKey)%%12
+  if (idxNew != 0){
+    return(names(keys)[idxNew])
+  }
+  else {
+    return(names(keys)[12])
+  }
+}
+
+changeChord <- function (key, chord){
+  return(str_replace_all(chord, "^[A-Z][#b]?", transposeKey(key, chord)))
+}
+```
+
+Some chords are so-called "slash" chords, meaning they consist of bass notes indicated by the note after the slash. The function below will include these notes in the transposition.
+
+```{r}
+slashChord <- function(key, chord) {
+  if (grepl("\\/[A-Z]", chord)){
+    afterSlash <- str_extract(chord, "(?<=\\/)[A-Z]")
+    afterSlash <- replaceSimilar(afterSlash)
+    return(str_replace_all(chord, "(?<=\\/).*", changeChord(key, afterSlash)))
+  }
+  else {
+    return(chord)
+  }
+}
+```
+
+Finally, the functions can be applied to the data.
+
+```{r}
+billEvans$key <- mapply(replaceSimilar, chord=billEvans$key)
+billEvans$chords <- mapply(replaceSimilar, chord=billEvans$chords)
+billEvans$newKey <- mapply(changeChord, key=billEvans$key, chord=billEvans$key)
+billEvans$newChord <- mapply(changeChord, key=billEvans$key, chord=billEvans$chords)
+billEvans$newChord <- mapply(slashChord, key=billEvans$key, chord=billEvans$newChord)
+```
+
+## Representing the chords as roman numerals
+
+Since chord progressions are independent of key, they are often written as roman numerals. The roman numeral represents one of seven chords characteristic to the specific key. I have decided to use this notation, because it will make it much more clear, which chords are out of key in a song.
+
+```{r}
+cMajor <- list("C"="I", "C7M"='I', "Dm"="ii", "Dm7"="ii", "Em"="iii", "Em7"="iii", "F"="IV", "F7M"="IV", "G"="V", "G7"="V", "Am"="vi", "Am7"="vi", "Bdim"="vii", "Bdim7"="vii")
+cMinor <- list("Cm"="i", "Cm7"="i", "Ddim"="ii", "Ddim7"="ii", "Eb"="III", "Eb7M"="III", "Fm"="iv", "Fm7"="iv", "Gm"="v", "Gm7"="v", "G#"="VI", "G#7M"="VI", "Bb"="VII", "Bb7"="VII")
+
+newNotation <- function(key, chord){
+  if (key=="C"){
+    if (is.null(cMajor[[str_extract(chord, "^[A-Z][#b]?(m)?(dim)?(7)?(M)?")]])==FALSE){
+      return(cMajor[[str_extract(chord, "^[A-Z][#b]?(m)?(dim)?(7)?(M)?")]])
+    }
+    else {
+      return(chord)
+    }
+  }
+  else {
+    if (is.null(cMinor[[str_extract(chord, "^[A-Z][#b]?(m)?(dim)?(7)?(M)?")]])==FALSE){
+      return(cMinor[[str_extract(chord, "^[A-Z][#b]?(m)?(dim)?(7)?(M)?")]])
+    }
+    else {
+      return(chord)
+    }
+  }
+}
+
+billEvans$newChord <- mapply(newNotation, key=billEvans$newKey, chord=billEvans$newChord)
+```
+
+## Transforming data frame into transactions usable by the association rules mining algorithms
+
+```{r}
+write.table(billEvans[,c(1,5)], file="transactions_bill_evans.csv", sep=";", row.names=FALSE)
+
+chordsEvans <- read.transactions("transactions_bill_evans.csv", sep=";", format="single", 
+                                       header=TRUE, cols=c(1:2))
+```
+
+# Association rules mining
+
+## Chords frequency
+
+Before mining the association rules, I will examine the frequency of chords on a bar plot. It is visible that some frequent chords are not represented by a roman numeral and therefore, do not belong in the keys of C major or C minor. Combined with the insight from the association rules, I will be able to tell when these "unusual" chords appear.
+
+```{r}
+chordsFreq <- itemFrequency(chordsEvans, type="absolute")
+chordsFreq <- sort(chordsFreq, decreasing=TRUE)[0:20]
+barplot(chordsFreq, las=2)
+```
+
+## Eclat algorithm rules
+
+In order to discover the association rules, Eclat algorithm can be applied. The alternative is the Apriori algorithm, but it is more memory expensive and usually works slower than Eclat. I will keep to the default support value of 0.2 and because I want lengthier chord progressions, I will keep their length set at a minimum of four chords.
+
+```{r results='hide'}
+chordsEclat <- eclat(chordsEvans, parameter=list(supp=0.2, minlen=4))
+eclatRules <- ruleInduction(chordsEclat, chordsEvans, confidence=0.6)
+```
+
+```{r echo=FALSE}
+inspect(head(eclatRules, 10))
+```
+
+### Rules sorted by support
+
+When sorting by support, only the most frequent combinations are highlighted. The results are to be expected, as these chord progressions are jazz staples. I-IV-ii-V, known as a Montgomery-Ward bridge is often used as a bridge of the jazz standard according to Wikipedia <https://en.wikipedia.org/wiki/Montgomery-Ward_bridge>. The other progression: I-vi-ii-V, is a very popular jazz "turnaround", which ends a particular section of the song. Based on the confidence value in rules 1, 5 and 9, it is also clear that the tonic (the "I" chord or in this case C major or C major 7) always accompanies the other chords from key.
+
+```{r}
+supportSortedRules <- sort(eclatRules, by="support", decreasing=TRUE) 
+inspect(head(supportSortedRules, 10))
+```
+
+### Rules sorted by confidence
+
+Rules with the highest confidence have the value of 1, which means that lhs and rhs always appear together. There are many rules like that, as exemplified below. Although the support value is lower, the appearance of the Fm7 and Ebdim chords is curious. They are both out of key, the former being a minor 7 chord instead of a major 7 chord and the latter not belonging in the key of C major at all.
+
+```{r}
+confidenceSortedRules <- sort(eclatRules, by="confidence", decreasing=TRUE) 
+inspect(head(confidenceSortedRules, 10))
+```
+
+### Rules sorted by lift
+
+Lift is another useful measure for inspecting association rules. It informs the researcher how much more probable it is to find rhs in the company of lhs, compared to when assuming that they are unrelated. Here, the exemplified rules are quite bizarre. Some of them do not include the tonic and they comprise of chords out of key. D7, E7 and A7 should be minor 7 chords in the key of C major, so the switch from minor 7 to 7 chord for the ii, iii and vi is an interesting procedure worth examining during composing. What also caught my eye, is that the appearance of A7 is completely dictated by E7, iii (Em or Em7) and IV (F or F7M).
+
+```{r}
+liftSortedRules <- sort(eclatRules, by="lift", decreasing=TRUE) 
+inspect(head(liftSortedRules, 10))
+```
+
+## Cleaned rules
+
+Cleaning association rules involves getting rid of redundant, insignificant and non-maximal rules. This leaves rules that are more general and statistically significant based on the Fischer's exact test. This will help make the rules more comprehensible and easier to visualize.
+
+```{r}
+rulesClean<-eclatRules[!is.redundant(eclatRules)]
+rulesClean<-rulesClean[is.significant(rulesClean, transactionsEvans)]
+rulesClean<-rulesClean[is.maximal(rulesClean)]
+```
+
+```{r echo=FALSE}
+inspect(head(rulesClean, 10))
+```
+
+### Cleaned rules sorted by support
+
+```{r}
+supportSortedClean <- sort(rulesClean, by="support", decreasing=TRUE) 
+inspect(head(supportSortedClean, 10))
+```
+
+### Cleaned rules sorted by confidence
+
+```{r}
+confidenceSortedClean <- sort(rulesClean, by="confidence", decreasing=TRUE) 
+inspect(head(confidenceSortedClean, 10))
+```
+
+### Cleaned rules sorted by lift
+
+After cleaning the association rules, there is some clarification relating to the inclusion of E7 in the chord combinations. It turns out that A7 and D7 work well with this chord.
+
+```{r}
+liftSortedClean <- sort(rulesClean, by="lift", decreasing=TRUE) 
+inspect(head(liftSortedClean, 10))
+```
+
+## Visualization of the cleaned association rules sorted by lift
+
+```{r}
+plot(rulesClean, method="grouped")
+```
+
+```{r}
+plot(rulesClean, method="graph", limit=10, engine="htmlwidget")
+```
+
+## Sequential rules
+
+A subset of association rules mining is sequential rules mining. It differs from the eclat and apriori algorithm in that it preserves the order in which items appear. So essentially it provides an information how past items influence the future item. This is perfect for analyzing chord progressions, because the discovered combinations of chords are ready to be used in the printed order. In R "arulesSequences" package implements the cSPADE (Sequential Pattern Discovery using Equivalence classes) algorithm that enables mining for sequential rules. It works by first counting the number of 1-element sequences and 2-element sequences. After that, subsequent n-element sequences are formed by joining (n-1) element sequences based on their id-lists. An id-list is a list of objects where the sequence occurs. This explanation comes from <https://en.wikibooks.org/wiki/Data_Mining_Algorithms_In_R/Sequence_Mining/SPADE>. The original paper is available at <https://link.springer.com/article/10.1023/A:1007652502315>.
+
+```{r}
+billEvansSeq <- billEvans %>%
+  group_by(name) %>%
+  mutate(eventID = row_number())
+
+billEvansSeq <- billEvansSeq %>%
+  relocate(eventID, .after=name)
+
+billEvansSeq <- billEvansSeq[,c(1,2,6)]
+
+names(billEvansSeq) <- c("sequenceID", "eventID", "items")
+
+billEvansSeq <- billEvansSeq[order(billEvansSeq$sequenceID, billEvansSeq$eventID),]
+
+write.table(billEvansSeq, file="seq_transactions_bill_evans.csv", sep=";", row.names=FALSE, col.names=FALSE)
+
+```
+
+```{r}
+seqEvans <- read_baskets("seq_transactions_bill_evans.csv", sep=";", info = c("sequenceID", "eventID"))
+```
+
+```{r results='hide'}
+cspadeSeq <- cspade(seqEvans, parameter = list(support = 0.1), control = list(verbose = TRUE))
+
+cspadeRules <- ruleInduction(cspadeSeq, confidence = 0.5, control = list(verbose = TRUE))
+```
+
+```{r}
+inspect(head(cspadeRules, 10))
+```
+
+### Sequential rules sorted by support
+
+Unfortunately, I cannot control the length of the rules and sorting by support provided pretty obvious pairs of chords from the same key.
+
+```{r}
+supportSortedSeq <- sort(cspadeRules, by="support", decreasing=TRUE)
+
+inspect(head(supportSortedSeq, 10))
+```
+
+### Sequential rules sorted by confidence
+
+Sorting by confidence definitely paid off. The rules are longer and include the unusual chords discovered earlier - E7 and D7. It is worth mentioning that when a chord reappears in the same rule, like V in the first one, it could be a variation of the V chord and not necessarily the same one. This implies that it might be a good idea to run cspade without the roman numerals, but for simplicity's sake I will keep them.
+
+```{r}
+confidenceSortedSeq <- sort(cspadeRules, by="confidence", decreasing=TRUE)
+
+inspect(head(confidenceSortedSeq, 10))
+```
+
+### Sequential rules sorted by lift
+
+Here, the results are similar to when sorting by support. There is not much interesting stuff happening in these rules, because all the chord progressions come from the same key and are short.
+
+```{r}
+liftSortedSeq <- sort(cspadeRules, by="lift", decreasing=TRUE)
+
+inspect(head(liftSortedSeq, 10))
+```
+
+# Conclusion
+
+Association rules mining has shown that there are some frequent chord progressions used in jazz music, like the I-IV-ii-V and the I-vi-ii-V. Moreover, I have discovered that in his compositions, Bill Evans has switched the ii, iii and vi minor 7 chords into 7 chords, with the switched iii often appearing with the switched ii and vi. By implementing the sequential rules mining algorithm, I also extracted some of the chord progressions with these switched chords. This is all valuable insight, for anyone interested in writing jazz music. As a guitar player, I have always been fascinated by the complexity of jazz and this project has confirmed to me that musical harmony does not need to follow simple structures. Not to mention, I did get to practice using regular expressions, which is a skill crucial in text mining.
